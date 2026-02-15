@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adapter-training"
+version = "0.1.0"
+description = "Adapter-Training und Inference für GGUF-basierte LLMs (ERNIE, Llama, Mistral etc.)"
+readme = "README.md"
+authors = [{name = "ShotokanOSS"}]
+license = {text = "Apache-2.0"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+]
+requires-python = ">=3.9"
+dependencies = [
+    "torch>=2.0",
+    "numpy",
+    "tqdm",
+    "datasets",
+    "huggingface-hub",
+    "llama-cpp-python>=0.2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black",
+    "isort",
+    "pytest",
+]
+
+[project.scripts]
+train-adapter = "adapter_training.train:main"
+run-inference = "adapter_training.inference:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["adapter_training*"]
+
