@@ -43,7 +43,7 @@ The system supports:
 ### 1. Clone Repository
 ```bash
 git clone https://github.com/ShotokanOSS/ggufForge.git
-cd adapter-training
+cd ggufForge
 ```
 
 ### 2. Create Virtual Environment (Recommended)
