@@ -22,6 +22,7 @@ dependencies = [
     "datasets",
     "huggingface-hub",
     "llama-cpp-python>=0.2.0",
+    "sentence_transformers",
 ]
 
 [project.optional-dependencies]
@@ -38,4 +39,3 @@ run-inference = "adapter_training.inference:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["adapter_training*"]
-
