@@ -7,6 +7,7 @@ Enhanced version:
 - Real‑time progress bar (loss, LR, grad norm)
 - Optional periodic evaluation and CSV logging
 - Automatic continuation from an existing adapter repository
+- Two adapter types: 'external' (original) and 'universal' (cross‑model)
 """
 
 import os
@@ -32,6 +33,7 @@ from llama_cpp import Llama
 from torch.nn.utils import clip_grad_norm_
 from huggingface_hub import HfApi, create_repo, upload_folder, get_token, whoami
 from huggingface_hub import hf_hub_download, list_repo_files
+from sentence_transformers import SentenceTransformer
 
 # =========================================================
 # CLI Argument Parser
@@ -43,8 +45,11 @@ def parse_arguments():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Train from scratch on ERNIE
+  # Train from scratch on ERNIE (universal adapter)
   python train_adapter.py --model unsloth/ERNIE-4.5-21B-A3B-Thinking-GGUF
+
+  # Train external adapter (original style)
+  python train_adapter.py --model unsloth/ERNIE-4.5-21B-A3B-Thinking-GGUF --adapter-type external
 
   # Continue training an existing adapter from Hugging Face
   python train_adapter.py --model my-username/my-adapter-repo
@@ -71,6 +76,13 @@ Examples:
                           help='Adapter dimension (default: 256)')
     model_group.add_argument('--heads', type=int, default=8,
                           help='Number of attention heads (default: 8)')
+    model_group.add_argument('--adapter-type', type=str, default='universal',
+                          choices=['universal', 'external'],
+                          help='Adapter architecture (default: universal)')
+    model_group.add_argument('--top-k', type=int, default=50,
+                          help='Top‑k for universal adapter (default: 50)')
+    model_group.add_argument('--semantic-dim', type=int, default=384,
+                          help='Semantic embedding dimension (default: 384)')
 
     # Training parameters
     train_group = parser.add_argument_group('Training Settings')
@@ -139,6 +151,7 @@ Examples:
 # Model Classes
 # =========================================================
 
+# ---------- External Adapter (original) ----------
 class CausalAttention(nn.Module):
     def __init__(self, dim, heads=8):
         super().__init__()
@@ -185,6 +198,53 @@ class ExternalCorrector(nn.Module):
 
         correction_logits = self.head(x)
         return correction_logits
+
+
+# ---------- Universal Adapter (cross‑model) ----------
+class SemanticMapper:
+    def __init__(self, llm, device):
+        self.embedder = SentenceTransformer('all-MiniLM-L6-v2', device=device)
+        self.llm = llm
+        self.cache = {}
+        self.device = device
+
+    def get_vectors(self, token_ids):
+        flat_ids = token_ids.flatten().tolist()
+        unique_ids = list(set(flat_ids))
+        missing = [i for i in unique_ids if i not in self.cache]
+        if missing:
+            texts = [self.llm.detokenize([i]).decode("utf-8", errors="ignore") for i in missing]
+            with torch.no_grad():
+                embs = self.embedder.encode(texts, convert_to_tensor=True, show_progress_bar=False).to(self.device)
+            for i, emb in zip(missing, embs):
+                self.cache[i] = emb
+        res = torch.stack([self.cache[i] for i in flat_ids]).to(self.device)
+        return res.view(*token_ids.shape, -1)
+
+class UniversalAdapter(nn.Module):
+    def __init__(self, semantic_dim=384, adapter_dim=256, heads=8):
+        super().__init__()
+        self.input_proj = nn.Linear(semantic_dim + 1, adapter_dim)
+        self.ln1 = nn.LayerNorm(adapter_dim)
+        self.attn = nn.MultiheadAttention(adapter_dim, num_heads=heads, batch_first=True)
+        self.ffn = nn.Sequential(
+            nn.Linear(adapter_dim, adapter_dim * 4),
+            nn.GELU(),
+            nn.Linear(adapter_dim * 4, adapter_dim)
+        )
+        self.ln2 = nn.LayerNorm(adapter_dim)
+        self.output_head = nn.Linear(adapter_dim, 1)
+
+    def forward(self, sem_embs, top_k_logits):
+        # sem_embs: (batch, seq, top_k, semantic_dim)
+        # top_k_logits: (batch, seq, top_k)
+        b, s, k, d = sem_embs.shape
+        x = torch.cat([sem_embs, top_k_logits.unsqueeze(-1)], dim=-1)  # (b,s,k,d+1)
+        x = self.input_proj(x).view(b * s, k, -1)
+        res, _ = self.attn(self.ln1(x), self.ln1(x), self.ln1(x))
+        x = x + res + self.ffn(self.ln2(x))
+        return self.output_head(x).view(b, s, k)
+
 
 # =========================================================
 # Helper Functions
@@ -339,6 +399,7 @@ def get_valid_text(sample, prompt_col, output_col, max_length=None):
 def save_config(args, vocab_size, config_path):
     """Saves configuration"""
     config = {
+        "adapter_type": args.adapter_type,
         "model": {
             "base_model": args.base_model if args.base_model else args.model,
             "filename": args.filename,
@@ -348,7 +409,7 @@ def save_config(args, vocab_size, config_path):
         "adapter": {
             "adapter_dim": args.adapter_dim,
             "heads": args.heads,
-            "architecture": "ExternalCorrector"
+            "architecture": "ExternalCorrector" if args.adapter_type == "external" else "UniversalAdapter"
         },
         "training": {
             "steps": args.steps,
@@ -374,6 +435,10 @@ def save_config(args, vocab_size, config_path):
             "gpu_layers": args.gpu_layers
         }
     }
+    if args.adapter_type == "universal":
+        config["adapter"]["top_k"] = args.top_k
+        config["adapter"]["semantic_dim"] = args.semantic_dim
+
     with open(config_path, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2, ensure_ascii=False)
     print(f"✅ Configuration saved: {config_path}")
@@ -425,9 +490,9 @@ def upload_to_huggingface(output_dir, repo_name, private=True, token=None):
         print(f"❌ Upload failed: {e}")
         return False
 
-def evaluate_model(llm, adapter, val_texts, device, context_size):
-    """Evaluates the model"""
-    print(f"\n📊 Evaluating on {len(val_texts)} examples...")
+def evaluate_model_external(llm, adapter, val_texts, device, context_size):
+    """Evaluates the external adapter (full vocab)"""
+    print(f"\n📊 Evaluating external adapter on {len(val_texts)} examples...")
     total_base_loss = 0.0
     total_adapt_loss = 0.0
     total_tokens = 0
@@ -484,7 +549,76 @@ def evaluate_model(llm, adapter, val_texts, device, context_size):
         adapt_ppl = math.exp(min(avg_adapt_loss, 700))
 
         print(f"\n{'='*50}")
-        print("📈 EVALUATION RESULTS")
+        print("📈 EVALUATION RESULTS (external)")
+        print(f"{'='*50}")
+        print(f"Base Model Perplexity:    {base_ppl:.2f}")
+        print(f"Adapted Model Perplexity: {adapt_ppl:.2f}")
+        print(f"Improvement:             {base_ppl - adapt_ppl:+.2f}")
+        print(f"Tokens evaluated:         {total_tokens:,}")
+        print(f"{'='*50}")
+
+        return {
+            "base_perplexity": float(base_ppl),
+            "adapted_perplexity": float(adapt_ppl),
+            "improvement": float(base_ppl - adapt_ppl),
+            "total_tokens": total_tokens,
+            "samples_evaluated": len(val_texts)
+        }
+    return None
+
+def evaluate_model_universal(llm, adapter, mapper, val_texts, device, context_size, top_k):
+    """Evaluates the universal adapter (top‑k correction)"""
+    print(f"\n📊 Evaluating universal adapter on {len(val_texts)} examples...")
+    total_base_loss = 0.0
+    total_adapt_loss = 0.0
+    total_tokens = 0
+    adapter.eval()
+
+    with torch.no_grad():
+        for text in tqdm(val_texts, desc="Evaluating"):
+            try:
+                tokens = llm.tokenize(text.encode("utf-8"), add_bos=True)
+            except:
+                tokens = llm.tokenize(text, add_bos=True)
+
+            if len(tokens) > context_size:
+                tokens = tokens[-context_size:]
+            if len(tokens) < 2:
+                continue
+
+            llm.reset()
+            llm.eval(tokens)
+            if len(llm.scores) < len(tokens) - 1:
+                continue
+
+            logits_list = [np.array(s) for s in llm.scores[:len(tokens)-1]]
+            base_logits = torch.from_numpy(np.stack(logits_list)).to(device)
+            targets = torch.tensor(tokens[1:], dtype=torch.long, device=device)
+
+            # Base loss
+            base_loss = F.cross_entropy(base_logits, targets, reduction='sum').item()
+
+            # Top‑k correction
+            top_v, top_i = torch.topk(base_logits, top_k, dim=-1)
+            sem_embs = mapper.get_vectors(top_i).unsqueeze(0)
+            corrections = adapter(sem_embs, top_v.unsqueeze(0)).squeeze(0)
+            final_logits = base_logits.clone()
+            final_logits.scatter_add_(1, top_i, corrections)
+            adapt_loss = F.cross_entropy(final_logits, targets, reduction='sum').item()
+
+            total_base_loss += base_loss
+            total_adapt_loss += adapt_loss
+            total_tokens += targets.numel()
+
+    if total_tokens > 0:
+        avg_base_loss = total_base_loss / total_tokens
+        avg_adapt_loss = total_adapt_loss / total_tokens
+
+        base_ppl = math.exp(min(avg_base_loss, 700))
+        adapt_ppl = math.exp(min(avg_adapt_loss, 700))
+
+        print(f"\n{'='*50}")
+        print("📈 EVALUATION RESULTS (universal)")
         print(f"{'='*50}")
         print(f"Base Model Perplexity:    {base_ppl:.2f}")
         print(f"Adapted Model Perplexity: {adapt_ppl:.2f}")
@@ -550,7 +684,11 @@ def main():
             if 'adapter' in adapter_config_from_repo:
                 repo_dim = adapter_config_from_repo['adapter'].get('adapter_dim')
                 repo_heads = adapter_config_from_repo['adapter'].get('heads')
-                if repo_dim and args.adapter_dim == 256:  # only if default
+                repo_type = adapter_config_from_repo.get('adapter_type')
+                if repo_type:
+                    args.adapter_type = repo_type
+                    print(f"   Using adapter_type={repo_type} from config")
+                if repo_dim and args.adapter_dim == 256:
                     args.adapter_dim = repo_dim
                     print(f"   Using adapter_dim={repo_dim} from config")
                 if repo_heads and args.heads == 8:
@@ -569,15 +707,23 @@ def main():
     )
 
     # Initialize adapter
-    print(f"\n🔧 Initializing adapter...")
+    print(f"\n🔧 Initializing adapter (type: {args.adapter_type})...")
     print(f"   Dimension: {args.adapter_dim}")
     print(f"   Heads: {args.heads}")
 
-    adapter = ExternalCorrector(
-        vocab_size=llm.n_vocab(),
-        embed_dim=args.adapter_dim,
-        heads=args.heads
-    ).to(device)
+    if args.adapter_type == "external":
+        adapter = ExternalCorrector(
+            vocab_size=llm.n_vocab(),
+            embed_dim=args.adapter_dim,
+            heads=args.heads
+        ).to(device)
+    else:  # universal
+        adapter = UniversalAdapter(
+            semantic_dim=args.semantic_dim,
+            adapter_dim=args.adapter_dim,
+            heads=args.heads
+        ).to(device)
+        mapper = SemanticMapper(llm, device)
 
     # Load adapter weights if we have a path (and no --checkpoint override)
     if args.checkpoint:
@@ -632,7 +778,10 @@ def main():
 
     # Evaluation only?
     if args.eval_only:
-        metrics = evaluate_model(llm, adapter, val_texts, device, args.context_size)
+        if args.adapter_type == "external":
+            metrics = evaluate_model_external(llm, adapter, val_texts, device, args.context_size)
+        else:
+            metrics = evaluate_model_universal(llm, adapter, mapper, val_texts, device, args.context_size, args.top_k)
         if metrics:
             os.makedirs(args.output_dir, exist_ok=True)
             with open(os.path.join(args.output_dir, "eval_metrics.json"), 'w', encoding='utf-8') as f:
@@ -729,24 +878,29 @@ def main():
         if len(llm.scores) < len(tokens) - 1:
             continue
 
-        llm_logits_list = [np.array(s) for s in llm.scores[:len(tokens)-1]]
-        input_llm_logits = torch.from_numpy(np.stack(llm_logits_list)).unsqueeze(0).to(device)
-
+        # Common: get base logits
+        logits_list = [np.array(s) for s in llm.scores[:len(tokens)-1]]
+        base_logits = torch.from_numpy(np.stack(logits_list)).unsqueeze(0).to(device)
         input_ids = torch.tensor(tokens[:-1], dtype=torch.long).unsqueeze(0).to(device)
         target_ids = torch.tensor(tokens[1:], dtype=torch.long).to(device)
 
-        base_logits = input_llm_logits
-        base_loss = F.cross_entropy(
-            base_logits.view(-1, llm.n_vocab()),
-            target_ids.view(-1)
-        )
-
-        correction = adapter(input_ids, input_llm_logits)
-        final_logits = base_logits + correction
-        adapted_loss = F.cross_entropy(
-            final_logits.view(-1, llm.n_vocab()),
-            target_ids.view(-1)
-        )
+        if args.adapter_type == "external":
+            # External adapter
+            correction = adapter(input_ids, base_logits)
+            final_logits = base_logits + correction
+            base_loss = F.cross_entropy(base_logits.view(-1, llm.n_vocab()), target_ids.view(-1))
+            adapted_loss = F.cross_entropy(final_logits.view(-1, llm.n_vocab()), target_ids.view(-1))
+        else:
+            # Universal adapter
+            # Compute top‑k and semantic embeddings
+            top_v, top_i = torch.topk(base_logits.squeeze(0), args.top_k, dim=-1)  # (seq, top_k)
+            sem_embs = mapper.get_vectors(top_i).unsqueeze(0)  # (1, seq, top_k, sem_dim)
+            corrections = adapter(sem_embs, top_v.unsqueeze(0))  # (1, seq, top_k)
+            # Apply corrections
+            final_logits = base_logits.clone()
+            final_logits.scatter_add_(2, top_i.unsqueeze(0), corrections)  # scatter add over vocab dimension
+            base_loss = F.cross_entropy(base_logits.view(-1, llm.n_vocab()), target_ids.view(-1))
+            adapted_loss = F.cross_entropy(final_logits.view(-1, llm.n_vocab()), target_ids.view(-1))
 
         (adapted_loss / args.accumulation_steps).backward()
 
@@ -784,7 +938,10 @@ def main():
         # Periodic evaluation
         if args.eval_steps > 0 and (step + 1) % args.eval_steps == 0:
             print(f"\n🔍 Running evaluation at step {step+1}...")
-            metrics = evaluate_model(llm, adapter, val_texts, device, args.context_size)
+            if args.adapter_type == "external":
+                metrics = evaluate_model_external(llm, adapter, val_texts, device, args.context_size)
+            else:
+                metrics = evaluate_model_universal(llm, adapter, mapper, val_texts, device, args.context_size, args.top_k)
             if metrics:
                 log_metrics(log_path, step+1,
                            avg_base if 'avg_base' in locals() else None,
@@ -833,7 +990,10 @@ def main():
     print(f"✅ Complete model: {final_checkpoint}")
 
     print(f"\n📊 Performing final evaluation...")
-    metrics = evaluate_model(llm, adapter, val_texts, device, args.context_size)
+    if args.adapter_type == "external":
+        metrics = evaluate_model_external(llm, adapter, val_texts, device, args.context_size)
+    else:
+        metrics = evaluate_model_universal(llm, adapter, mapper, val_texts, device, args.context_size, args.top_k)
 
     if metrics:
         metrics_path = os.path.join(output_dir, "training_metrics.json")
@@ -842,6 +1002,7 @@ def main():
                 **metrics,
                 'training_steps': args.steps,
                 'adapter_config': {
+                    'type': args.adapter_type,
                     'dim': args.adapter_dim,
                     'heads': args.heads
                 }
@@ -863,6 +1024,7 @@ def main():
     print(f"Base Model:   {base_repo}")
     print(f"Dataset:      {args.dataset}")
     print(f"Steps:        {args.steps:,}")
+    print(f"Adapter Type: {args.adapter_type}")
     print(f"Adapter Dim:  {args.adapter_dim}")
     print(f"Checkpoints:  {output_dir}/")
     if metrics:
